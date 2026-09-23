@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bunkr Media Batch Downloader
 // @namespace    https://chatgpt.com/
-// @version      1.2.0
+// @version      1.2.1
 // @description  Batch-download Bunkr videos or images into one folder you choose, with robust streaming and safe failure limits.
 // @homepageURL  https://github.com/bomboclaat12369/bunkr-media-batch-downloader
 // @updateURL    https://raw.githubusercontent.com/bomboclaat12369/bunkr-media-batch-downloader/main/bunkr_media_batch_downloader.user.js
@@ -66,6 +66,7 @@
         consecutiveFailures: 0,
         lastError: '',
         abortReason: '',
+        safeNameCounter: 0,
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -87,12 +88,79 @@
         return 'other';
     }
 
-    function safeFilename(name) {
-        const cleaned = String(name || 'bunkr_file')
-            .replace(/[\\/:*?"<>|\x00-\x1F]/g, '_')
-            .replace(/[. ]+$/g, '')
+    function truncateByCharacters(value, maxLength) {
+        return Array.from(String(value || '')).slice(0, maxLength).join('');
+    }
+
+    function safeFilename(name, aggressive = false) {
+        let cleaned = String(name || 'bunkr_file');
+
+        try {
+            cleaned = cleaned.normalize('NFKC');
+        } catch {}
+
+        cleaned = cleaned
+            .replace(/[\\/:*?"<>|\u0000-\u001F\u007F-\u009F]/g, '_')
+            .replace(/[\r\n\u2028\u2029]/g, '_')
+            .replace(/\s+/g, ' ')
+            .replace(/^[. ]+|[. ]+$/g, '')
             .trim();
-        return (cleaned || 'bunkr_file').slice(0, 220);
+
+        if (aggressive) {
+            cleaned = cleaned
+                .replace(/[^A-Za-z0-9._()\- ]+/g, '_')
+                .replace(/_+/g, '_')
+                .replace(/^[. ]+|[. ]+$/g, '');
+        }
+
+        if (!cleaned || cleaned === '.' || cleaned === '..') {
+            cleaned = 'bunkr_file';
+        }
+
+        const dot = cleaned.lastIndexOf('.');
+        const hasExt = dot > 0 && dot < cleaned.length - 1;
+        let base = hasExt ? cleaned.slice(0, dot) : cleaned;
+        let ext = hasExt ? cleaned.slice(dot) : '';
+
+        // Windows-reserved device names can be rejected even when an extension is present.
+        if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(base)) {
+            base = `_${base}`;
+        }
+
+        // Keep filenames conservative so long destination paths and multi-byte names
+        // do not trip Chromium/Windows filename limits.
+        ext = truncateByCharacters(ext, 16);
+        const maxTotal = aggressive ? 80 : 120;
+        const maxBase = Math.max(16, maxTotal - Array.from(ext).length);
+        base = truncateByCharacters(base, maxBase).replace(/[. ]+$/g, '');
+
+        if (!base) base = 'bunkr_file';
+        return `${base}${ext}`;
+    }
+
+    function addFilenameSuffix(filename, suffix) {
+        const clean = String(filename || 'bunkr_file');
+        const dot = clean.lastIndexOf('.');
+        const hasExt = dot > 0 && dot < clean.length - 1;
+        const base = hasExt ? clean.slice(0, dot) : clean;
+        const ext = hasExt ? clean.slice(dot) : '';
+        const suffixText = suffix ? ` (${suffix})` : '';
+        const maxBase = Math.max(12, 120 - Array.from(ext).length - Array.from(suffixText).length);
+        return `${truncateByCharacters(base, maxBase).replace(/[. ]+$/g, '') || 'bunkr_file'}${suffixText}${ext}`;
+    }
+
+    function isInvalidFilenameError(error) {
+        const message = String(error?.message || '');
+        return error?.name === 'TypeError' || /name is not allowed|invalid.*(?:file)?name/i.test(message);
+    }
+
+    function filenameFallbacks(filename) {
+        const normal = safeFilename(filename, false);
+        const aggressive = safeFilename(filename, true);
+        const ext = extensionOf(normal);
+        const generated = `bunkr_file_${++state.safeNameCounter}${ext ? `.${ext}` : ''}`;
+
+        return [...new Set([normal, aggressive, generated])];
     }
 
     function pageFileName(card, link, index) {
@@ -368,24 +436,44 @@
     }
 
     async function createUniqueFileHandle(directoryHandle, filename) {
-        const clean = safeFilename(filename);
-        const dot = clean.lastIndexOf('.');
-        const hasExt = dot > 0 && dot < clean.length - 1;
-        const base = hasExt ? clean.slice(0, dot) : clean;
-        const ext = hasExt ? clean.slice(dot) : '';
-    
-        for (let index = 0; index < 10000; index++) {
-            const candidate = index === 0 ? clean : `${base} (${index})${ext}`;
-            try {
-                await directoryHandle.getFileHandle(candidate, { create: false });
-            } catch (error) {
-                if (error?.name !== 'NotFoundError') throw error;
-                const handle = await directoryHandle.getFileHandle(candidate, { create: true });
-                return { handle, filename: candidate };
+        const baseCandidates = filenameFallbacks(filename);
+
+        for (const baseCandidate of baseCandidates) {
+            for (let index = 0; index < 1000; index++) {
+                const candidate = addFilenameSuffix(baseCandidate, index || '');
+
+                try {
+                    await directoryHandle.getFileHandle(candidate, { create: false });
+                } catch (error) {
+                    if (isInvalidFilenameError(error)) {
+                        // Try the next, more conservative filename form.
+                        break;
+                    }
+
+                    if (error?.name !== 'NotFoundError') throw error;
+
+                    try {
+                        const handle = await directoryHandle.getFileHandle(candidate, { create: true });
+                        return {
+                            handle,
+                            filename: candidate,
+                            renamed: candidate !== filename,
+                        };
+                    } catch (createError) {
+                        if (isInvalidFilenameError(createError)) {
+                            // The OS/browser rejected this name. Fall back automatically
+                            // rather than treating the media download itself as failed.
+                            break;
+                        }
+                        throw createError;
+                    }
+                }
             }
         }
-    
-        throw new Error(`Could not create a unique filename for ${clean}`);
+
+        throw new Error(
+            `Could not create a valid local filename for "${safeFilename(filename, true)}"`
+        );
     }
 
     function errorText(error) {
@@ -861,7 +949,7 @@
         const panel = document.createElement('div');
         panel.id = 'cbk-panel';
         panel.innerHTML = `
-            <div id="cbk-title">Bunkr Batch Downloader v1.2.0</div>
+            <div id="cbk-title">Bunkr Batch Downloader v1.2.1</div>
             <div id="cbk-counts">Scanning album…</div>
             <button class="cbk-button" id="cbk-videos">Download All Videos</button>
             <button class="cbk-button" id="cbk-images">Download All Images</button>
