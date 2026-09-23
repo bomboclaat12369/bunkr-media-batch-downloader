@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bunkr Media Batch Downloader
 // @namespace    https://chatgpt.com/
-// @version      1.2.1
+// @version      1.3.0
 // @description  Batch-download Bunkr videos or images into one folder you choose, with robust streaming and safe failure limits.
 // @homepageURL  https://github.com/bomboclaat12369/bunkr-media-batch-downloader
 // @updateURL    https://raw.githubusercontent.com/bomboclaat12369/bunkr-media-batch-downloader/main/bunkr_media_batch_downloader.user.js
@@ -674,30 +674,33 @@
 
     async function downloadOne(item, targetKind) {
         let lastError;
-    
+        let resolvedFilename = item.name;
+
         for (let attempt = 1; attempt <= CONFIG.retries; attempt++) {
             if (state.cancelled) throw new Error('Cancelled');
             try {
                 setStatus(`Resolving: ${item.name}`);
                 const resolved = await resolveDownload(item);
+                resolvedFilename = resolved.filename || item.name;
                 const resolvedKind = kindFrom(resolved.filename, item.siteType);
-    
+
                 if (resolvedKind !== targetKind) {
                     return { skipped: true, reason: `Resolved as ${resolvedKind}` };
                 }
-    
+
                 setStatus(`Downloading to ${state.directoryHandle?.name || 'selected folder'}: ${resolved.filename}`);
                 await downloadToFolder(resolved.url, resolved.filename, state.directoryHandle);
                 return { skipped: false };
             } catch (error) {
-                lastError = error;
+                lastError = error instanceof Error ? error : new Error(String(error));
+                lastError.downloadName = resolvedFilename || item.name;
                 if (attempt < CONFIG.retries && !state.cancelled) {
-                    setStatus(`Retry ${attempt}/${CONFIG.retries - 1}: ${item.name} — ${errorText(error)}`);
+                    setStatus(`Retry ${attempt}/${CONFIG.retries - 1}: ${resolvedFilename || item.name} — ${errorText(lastError)}`);
                     await sleep(CONFIG.retryDelayMs * attempt);
                 }
             }
         }
-    
+
         throw lastError || new Error('Download failed');
     }
 
@@ -707,15 +710,16 @@
         return all.filter(item => item.kind === targetKind || item.kind === 'other');
     }
 
-    async function runBatch(targetKind) {
+    async function runBatch(targetKind, retryQueue = null) {
         if (state.running) return;
+
+        const isRetry = Array.isArray(retryQueue);
+        const all = isRetry ? [] : scanAlbum();
+        const knownTarget = isRetry ? [] : all.filter(item => item.kind === targetKind);
+        const unknown = isRetry ? [] : all.filter(item => item.kind === 'other');
+        const queue = isRetry ? [...retryQueue] : [...knownTarget, ...unknown];
     
-        const all = scanAlbum();
-        const knownTarget = all.filter(item => item.kind === targetKind);
-        const unknown = all.filter(item => item.kind === 'other');
-        const queue = [...knownTarget, ...unknown];
-    
-        if (!all.length) {
+        if (!isRetry && !all.length) {
             setStatus('No Bunkr files found on this album page.');
             return;
         }
@@ -725,7 +729,7 @@
             return;
         }
     
-        setStatus('Choose the folder where this batch should be saved…');
+        setStatus(isRetry ? 'Choose the folder for the failed-file retry…' : 'Choose the folder where this batch should be saved…');
         let directoryHandle;
         try {
             directoryHandle = await chooseDestinationFolder();
@@ -756,9 +760,10 @@
         });
     
         state.activeRequests.clear();
+        renderFailures();
         setButtonsRunning(true);
         updateProgress();
-        setStatus(`Saving ${targetKind === 'video' ? 'videos' : 'images'} to “${directoryHandle.name}”…`);
+        setStatus(isRetry ? `Retrying ${queue.length} failed ${targetKind === 'video' ? 'video(s)' : 'image(s)'} in “${directoryHandle.name}”…` : `Saving ${targetKind === 'video' ? 'videos' : 'images'} to “${directoryHandle.name}”…`);
     
         let cursor = 0;
     
@@ -779,8 +784,15 @@
                         state.failed++;
                         state.consecutiveFailures++;
                         state.lastError = errorText(error);
-                        state.failures.push({ item: item.name, error: state.lastError });
-                        console.warn('[Bunkr Batch Downloader]', item.name, error);
+                        const failedName = error?.downloadName || item.name || item.slug || 'Unknown file';
+                        state.failures.push({
+                            name: failedName,
+                            error: state.lastError,
+                            pageUrl: item.pageUrl,
+                            itemData: { ...item },
+                        });
+                        renderFailures();
+                        console.warn('[Bunkr Batch Downloader]', failedName, error);
 
                         if (state.consecutiveFailures >= CONFIG.maxConsecutiveFailures) {
                             state.abortReason =
@@ -804,6 +816,7 @@
     
         state.running = false;
         setButtonsRunning(false);
+        renderFailures();
     
         if (state.cancelled) {
             setStatus(
@@ -821,7 +834,11 @@
         setStatus(parts.join(', ') + '.');
     
         if (state.failures.length) {
-            console.table(state.failures);
+            console.table(state.failures.map(f => ({
+                name: f.name,
+                error: f.error,
+                pageUrl: f.pageUrl,
+            })));
         }
     
         refreshCounts();
@@ -837,6 +854,103 @@
         }
         const stop = document.getElementById('cbk-stop');
         if (stop) stop.disabled = true;
+    }
+
+    function renderFailures() {
+        const wrap = document.getElementById('cbk-failures');
+        const list = document.getElementById('cbk-failure-list');
+        const retry = document.getElementById('cbk-retry-failed');
+        const copy = document.getElementById('cbk-copy-failed');
+        if (!wrap || !list || !retry || !copy) return;
+
+        const failures = state.failures || [];
+        if (!failures.length) {
+            wrap.style.display = 'none';
+            list.replaceChildren();
+            retry.style.display = 'none';
+            copy.style.display = 'none';
+            return;
+        }
+
+        wrap.style.display = 'block';
+        list.replaceChildren();
+
+        failures.forEach((failure, index) => {
+            const row = document.createElement('div');
+            row.className = 'cbk-failure-row';
+
+            const top = document.createElement('div');
+            top.className = 'cbk-failure-top';
+
+            const number = document.createElement('span');
+            number.className = 'cbk-failure-number';
+            number.textContent = `${index + 1}.`;
+
+            const link = document.createElement('a');
+            link.className = 'cbk-failure-link';
+            link.textContent = failure.name || 'Unknown file';
+            link.href = failure.pageUrl || '#';
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.title = 'Open this Bunkr file page';
+
+            top.append(number, link);
+
+            const reason = document.createElement('div');
+            reason.className = 'cbk-failure-error';
+            reason.textContent = failure.error || 'Download failed';
+
+            row.append(top, reason);
+            list.appendChild(row);
+        });
+
+        retry.textContent = `Retry Failed Only (${failures.length})`;
+        retry.style.display = state.running ? 'none' : 'block';
+        copy.style.display = state.running ? 'none' : 'block';
+    }
+
+    async function retryFailedOnly() {
+        if (state.running || !state.failures.length) return;
+
+        const queue = state.failures
+            .map(f => f.itemData)
+            .filter(item => item?.pageUrl);
+
+        if (!queue.length) {
+            setStatus('The failed-file list no longer has enough information to retry.');
+            return;
+        }
+
+        const targetKind = state.targetKind || kindFrom(state.failures[0]?.name);
+        if (targetKind !== 'video' && targetKind !== 'image') {
+            setStatus('Could not determine whether the failed files are videos or images.');
+            return;
+        }
+
+        await runBatch(targetKind, queue);
+    }
+
+    async function copyFailedNames() {
+        if (!state.failures.length) return;
+
+        const text = state.failures
+            .map((f, i) => `${i + 1}. ${f.name}${f.pageUrl ? `\n   ${f.pageUrl}` : ''}`)
+            .join('\n');
+
+        try {
+            await navigator.clipboard.writeText(text);
+            setStatus(`Copied ${state.failures.length} failed file name(s) and links.`);
+        } catch {
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.style.position = 'fixed';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand('copy');
+            area.remove();
+            setStatus(`Copied ${state.failures.length} failed file name(s) and links.`);
+        }
     }
 
     function setStatus(text) {
@@ -861,12 +975,16 @@
         const video = document.getElementById('cbk-videos');
         const image = document.getElementById('cbk-images');
         const stop = document.getElementById('cbk-stop');
+        const retry = document.getElementById('cbk-retry-failed');
+        const copy = document.getElementById('cbk-copy-failed');
         if (video) video.disabled = running;
         if (image) image.disabled = running;
         if (stop) {
             stop.disabled = !running;
             stop.style.display = running ? 'block' : 'none';
         }
+        if (retry) retry.style.display = !running && state.failures.length ? 'block' : 'none';
+        if (copy) copy.style.display = !running && state.failures.length ? 'block' : 'none';
     }
 
     function refreshCounts() {
@@ -922,6 +1040,48 @@
             #cbk-videos { background: #2563eb; }
             #cbk-images { background: #7c3aed; }
             #cbk-stop { background: #b91c1c; display: none; }
+            #cbk-retry-failed { background: #d97706; display: none; }
+            #cbk-copy-failed { background: #374151; display: none; }
+            #cbk-failures {
+                display: none;
+                margin-top: 10px;
+                padding-top: 9px;
+                border-top: 1px solid rgba(255,255,255,.10);
+            }
+            #cbk-failure-heading {
+                font-size: 11px;
+                font-weight: 700;
+                color: #fca5a5;
+                margin-bottom: 5px;
+            }
+            #cbk-failure-list {
+                max-height: 180px;
+                overflow-y: auto;
+                padding-right: 4px;
+            }
+            .cbk-failure-row {
+                padding: 6px 0;
+                border-bottom: 1px solid rgba(255,255,255,.07);
+            }
+            .cbk-failure-top {
+                display: flex;
+                gap: 5px;
+                align-items: flex-start;
+                font-size: 11px;
+            }
+            .cbk-failure-number { color: #fca5a5; flex: 0 0 auto; }
+            .cbk-failure-link {
+                color: #f5f5f5;
+                text-decoration: underline;
+                overflow-wrap: anywhere;
+            }
+            .cbk-failure-error {
+                margin: 3px 0 0 17px;
+                color: #a8a8ad;
+                font-size: 10px;
+                line-height: 1.3;
+                overflow-wrap: anywhere;
+            }
             #cbk-track {
                 height: 6px;
                 background: #29292e;
@@ -949,21 +1109,30 @@
         const panel = document.createElement('div');
         panel.id = 'cbk-panel';
         panel.innerHTML = `
-            <div id="cbk-title">Bunkr Batch Downloader v1.2.1</div>
+            <div id="cbk-title">Bunkr Batch Downloader v1.3.0</div>
             <div id="cbk-counts">Scanning album…</div>
             <button class="cbk-button" id="cbk-videos">Download All Videos</button>
             <button class="cbk-button" id="cbk-images">Download All Images</button>
             <button class="cbk-button" id="cbk-stop">Stop</button>
+            <button class="cbk-button" id="cbk-retry-failed">Retry Failed Only</button>
+            <button class="cbk-button" id="cbk-copy-failed">Copy Failed List</button>
             <div id="cbk-track"><div id="cbk-progress"></div></div>
             <div id="cbk-progress-label"></div>
             <div id="cbk-status">Ready. Click a batch button, then choose its destination folder once.</div>
+            <div id="cbk-failures">
+                <div id="cbk-failure-heading">Failed files</div>
+                <div id="cbk-failure-list"></div>
+            </div>
         `;
         document.body.appendChild(panel);
 
         document.getElementById('cbk-videos').addEventListener('click', () => runBatch('video'));
         document.getElementById('cbk-images').addEventListener('click', () => runBatch('image'));
         document.getElementById('cbk-stop').addEventListener('click', cancelBatch);
+        document.getElementById('cbk-retry-failed').addEventListener('click', retryFailedOnly);
+        document.getElementById('cbk-copy-failed').addEventListener('click', copyFailedNames);
 
+        renderFailures();
         refreshCounts();
         setTimeout(refreshCounts, 1200);
         setTimeout(refreshCounts, 3000);
