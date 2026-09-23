@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bunkr Media Batch Downloader
 // @namespace    https://chatgpt.com/
-// @version      1.1.1
-// @description  Adds separate batch buttons for Bunkr videos/images and saves each batch directly into one folder you choose.
+// @version      1.2.0
+// @description  Batch-download Bunkr videos or images into one folder you choose, with robust streaming and safe failure limits.
 // @homepageURL  https://github.com/bomboclaat12369/bunkr-media-batch-downloader
 // @updateURL    https://raw.githubusercontent.com/bomboclaat12369/bunkr-media-batch-downloader/main/bunkr_media_batch_downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/bomboclaat12369/bunkr-media-batch-downloader/main/bunkr_media_batch_downloader.user.js
@@ -31,11 +31,12 @@
     'use strict';
 
     const CONFIG = {
-        concurrency: 2,
+        concurrency: 1,
         requestTimeoutMs: 30000,
-        retries: 3,
-        retryDelayMs: 1200,
-        betweenItemsMs: 350,
+        retries: 2,
+        retryDelayMs: 2500,
+        betweenItemsMs: 900,
+        maxConsecutiveFailures: 3,
         apiUrl: 'https://dl.bunkr.cr/api/_001_v2',
         signUrl: 'https://glb-apisign.cdn.cr/sign',
     };
@@ -62,6 +63,9 @@
         targetKind: null,
         directoryHandle: null,
         activeRequests: new Set(),
+        consecutiveFailures: 0,
+        lastError: '',
+        abortReason: '',
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -384,77 +388,200 @@
         throw new Error(`Could not create a unique filename for ${clean}`);
     }
 
-    async function downloadToFolder(url, filename, directoryHandle) {
-        const { handle, filename: outputName } = await createUniqueFileHandle(directoryHandle, filename);
-        const writable = await handle.createWritable();
-    
+    function errorText(error) {
+        if (!error) return 'Unknown error';
+        const name = error.name && error.name !== 'Error' ? `${error.name}: ` : '';
+        return `${name}${error.message || String(error)}`;
+    }
+
+    async function normalizeChunk(value) {
+        if (value == null) return null;
+
+        if (ArrayBuffer.isView(value)) {
+            const source = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+            const copy = new Uint8Array(source.byteLength);
+            copy.set(source);
+            return copy;
+        }
+
+        if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') {
+            const source = new Uint8Array(value);
+            const copy = new Uint8Array(source.byteLength);
+            copy.set(source);
+            return copy;
+        }
+
+        if (typeof value.arrayBuffer === 'function') {
+            const buffer = await value.arrayBuffer();
+            const source = new Uint8Array(buffer);
+            const copy = new Uint8Array(source.byteLength);
+            copy.set(source);
+            return copy;
+        }
+
+        throw new Error(`Unsupported download chunk type: ${Object.prototype.toString.call(value)}`);
+    }
+
+    function toPageRealmBytes(bytes) {
+        const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const PageUint8Array = pageWindow?.Uint8Array || Uint8Array;
+        const output = new PageUint8Array(bytes.byteLength);
+        output.set(bytes);
+        return output;
+    }
+
+    async function copyReaderToFile(reader, fileHandle) {
+        const writable = await fileHandle.createWritable();
+        let position = 0;
+
+        try {
+            while (true) {
+                if (state.cancelled) {
+                    try { await reader.cancel(); } catch {}
+                    throw new Error('Cancelled');
+                }
+
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const bytes = await normalizeChunk(value);
+                if (!bytes?.byteLength) continue;
+
+                const pageBytes = toPageRealmBytes(bytes);
+                await writable.write({
+                    type: 'write',
+                    position,
+                    data: pageBytes,
+                });
+                position += pageBytes.byteLength;
+            }
+
+            await writable.close();
+            return position;
+        } catch (error) {
+            try { await writable.abort(); } catch {}
+            throw error;
+        }
+    }
+
+    async function downloadWithNativeFetch(url, fileHandle) {
+        const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const fetchFn = pageWindow?.fetch;
+        if (typeof fetchFn !== 'function') throw new Error('Native fetch is unavailable');
+
+        const response = await fetchFn.call(pageWindow, url, {
+            method: 'GET',
+            credentials: 'omit',
+            cache: 'no-store',
+            redirect: 'follow',
+        });
+
+        if (!response.ok) {
+            const error = new Error(`CDN download returned HTTP ${response.status}`);
+            error.status = response.status;
+            throw error;
+        }
+        if (!response.body?.getReader) throw new Error('Native download stream is unavailable');
+
+        return copyReaderToFile(response.body.getReader(), fileHandle);
+    }
+
+    function downloadWithGmStream(url, fileHandle) {
         return new Promise((resolve, reject) => {
             let settled = false;
+            let streamStarted = false;
             let request = null;
-    
+
             const cleanup = () => {
                 if (request) state.activeRequests.delete(request);
             };
-    
-            const fail = async error => {
+
+            const fail = error => {
                 if (settled) return;
                 settled = true;
                 cleanup();
-                try { await writable.abort(); } catch {}
-                try { await directoryHandle.removeEntry(outputName); } catch {}
                 reject(error instanceof Error ? error : new Error(String(error)));
             };
-    
+
             request = GM_xmlhttpRequest({
                 method: 'GET',
                 url,
                 responseType: 'stream',
+                anonymous: true,
+                fetch: true,
                 timeout: 0,
-                onloadstart: async response => {
-                    try {
-                        if (response.status && (response.status < 200 || response.status >= 300)) {
-                            throw new Error(`Download returned HTTP ${response.status}`);
-                        }
-    
-                        const stream = response.response;
-                        if (!stream || typeof stream.getReader !== 'function') {
-                            throw new Error('Tampermonkey streaming is unavailable. Update Tampermonkey to the current version and try again.');
-                        }
-    
-                        const reader = stream.getReader();
-                        while (true) {
-                            if (state.cancelled) {
-                                try { await reader.cancel(); } catch {}
-                                throw new Error('Cancelled');
-                            }
-    
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            await writable.write(value);
-                        }
-    
-                        await writable.close();
-                        if (!settled) {
-                            settled = true;
-                            cleanup();
-                            resolve({ filename: outputName });
-                        }
-                    } catch (error) {
-                        await fail(error);
+                onloadstart: response => {
+                    streamStarted = true;
+
+                    if (response.status && (response.status < 200 || response.status >= 300)) {
+                        const error = new Error(`CDN download returned HTTP ${response.status}`);
+                        error.status = response.status;
+                        fail(error);
+                        try { request?.abort(); } catch {}
+                        return;
                     }
+
+                    const stream = response.response;
+                    if (!stream || typeof stream.getReader !== 'function') {
+                        fail(new Error('Tampermonkey did not provide a readable download stream'));
+                        try { request?.abort(); } catch {}
+                        return;
+                    }
+
+                    (async () => {
+                        try {
+                            const bytes = await copyReaderToFile(stream.getReader(), fileHandle);
+                            if (!settled) {
+                                settled = true;
+                                cleanup();
+                                resolve(bytes);
+                            }
+                        } catch (error) {
+                            try { request?.abort(); } catch {}
+                            fail(error);
+                        }
+                    })();
                 },
                 onload: response => {
                     if (response.status < 200 || response.status >= 300) {
-                        fail(new Error(`Download returned HTTP ${response.status}`));
+                        const error = new Error(`CDN download returned HTTP ${response.status}`);
+                        error.status = response.status;
+                        fail(error);
+                    } else if (!streamStarted) {
+                        fail(new Error('Tampermonkey completed the request without exposing its download stream'));
                     }
                 },
-                onerror: err => fail(new Error(`Download failed (${err?.error || 'network error'})`)),
-                ontimeout: () => fail(new Error('Download timed out')),
-                onabort: () => fail(new Error(state.cancelled ? 'Cancelled' : 'Download aborted')),
+                onerror: err => fail(new Error(`CDN download network error (${err?.error || 'unknown'})`)),
+                ontimeout: () => fail(new Error('CDN download timed out')),
+                onabort: () => fail(new Error(state.cancelled ? 'Cancelled' : 'CDN download aborted')),
             });
-    
+
             state.activeRequests.add(request);
         });
+    }
+
+    async function downloadToFolder(url, filename, directoryHandle) {
+        const { handle, filename: outputName } = await createUniqueFileHandle(directoryHandle, filename);
+        let nativeError = null;
+
+        try {
+            await downloadWithNativeFetch(url, handle);
+            return { filename: outputName, method: 'native-stream' };
+        } catch (error) {
+            nativeError = error;
+            if (state.cancelled) throw error;
+            console.debug('[Bunkr Batch Downloader] Native stream unavailable; trying Tampermonkey stream', error);
+        }
+
+        try {
+            await downloadWithGmStream(url, handle);
+            return { filename: outputName, method: 'gm-stream' };
+        } catch (gmError) {
+            try { await directoryHandle.removeEntry(outputName); } catch {}
+            throw new Error(
+                `Folder download failed. Native: ${errorText(nativeError)} | Tampermonkey: ${errorText(gmError)}`
+            );
+        }
     }
 
     async function downloadOne(item, targetKind) {
@@ -477,7 +604,7 @@
             } catch (error) {
                 lastError = error;
                 if (attempt < CONFIG.retries && !state.cancelled) {
-                    setStatus(`Retry ${attempt}/${CONFIG.retries - 1}: ${item.name}`);
+                    setStatus(`Retry ${attempt}/${CONFIG.retries - 1}: ${item.name} — ${errorText(error)}`);
                     await sleep(CONFIG.retryDelayMs * attempt);
                 }
             }
@@ -535,6 +662,9 @@
             failures: [],
             targetKind,
             directoryHandle,
+            consecutiveFailures: 0,
+            lastError: '',
+            abortReason: '',
         });
     
         state.activeRequests.clear();
@@ -552,18 +682,30 @@
     
                 try {
                     const result = await downloadOne(item, targetKind);
+                    state.consecutiveFailures = 0;
+                    state.lastError = '';
                     if (result.skipped) state.skipped++;
                     else state.downloaded++;
                 } catch (error) {
-                    if (state.cancelled) return;
-                    state.failed++;
-                    state.failures.push({ item: item.name, error: error.message });
-                    console.warn('[Bunkr Batch Downloader]', item.name, error);
-                } finally {
                     if (!state.cancelled) {
-                        state.finished++;
-                        updateProgress();
+                        state.failed++;
+                        state.consecutiveFailures++;
+                        state.lastError = errorText(error);
+                        state.failures.push({ item: item.name, error: state.lastError });
+                        console.warn('[Bunkr Batch Downloader]', item.name, error);
+
+                        if (state.consecutiveFailures >= CONFIG.maxConsecutiveFailures) {
+                            state.abortReason =
+                                `Stopped automatically after ${CONFIG.maxConsecutiveFailures} consecutive failures. Last error: ${state.lastError}`;
+                            state.cancelled = true;
+                            for (const request of [...state.activeRequests]) {
+                                try { request.abort(); } catch {}
+                            }
+                        }
                     }
+                } finally {
+                    state.finished++;
+                    updateProgress();
                 }
     
                 await sleep(CONFIG.betweenItemsMs);
@@ -576,7 +718,11 @@
         setButtonsRunning(false);
     
         if (state.cancelled) {
-            setStatus(`Cancelled — ${state.downloaded} downloaded before stopping.`);
+            setStatus(
+                state.abortReason
+                    ? `${state.abortReason} ${state.downloaded} file(s) were saved before stopping.`
+                    : `Cancelled — ${state.downloaded} downloaded before stopping.`
+            );
             return;
         }
     
@@ -596,6 +742,7 @@
     function cancelBatch() {
         if (!state.running) return;
         state.cancelled = true;
+        state.abortReason = '';
         setStatus('Stopping current download(s)…');
         for (const request of [...state.activeRequests]) {
             try { request.abort(); } catch {}
@@ -616,7 +763,8 @@
         if (bar) bar.style.width = `${pct}%`;
         if (label) {
             label.textContent = state.running
-                ? `${state.finished}/${state.total} processed • ${state.downloaded} downloaded • ${state.failed} failed`
+                ? `${state.finished}/${state.total} processed • ${state.downloaded} downloaded • ${state.failed} failed` +
+                  (state.consecutiveFailures ? ` • ${state.consecutiveFailures} consecutive failures` : '')
                 : '';
         }
     }
@@ -713,7 +861,7 @@
         const panel = document.createElement('div');
         panel.id = 'cbk-panel';
         panel.innerHTML = `
-            <div id="cbk-title">Bunkr Batch Downloader</div>
+            <div id="cbk-title">Bunkr Batch Downloader v1.2.0</div>
             <div id="cbk-counts">Scanning album…</div>
             <button class="cbk-button" id="cbk-videos">Download All Videos</button>
             <button class="cbk-button" id="cbk-images">Download All Images</button>
